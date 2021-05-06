@@ -328,7 +328,7 @@ impl BankForks {
 mod tests {
     use super::*;
     use crate::{
-        bank::tests::update_vote_account_timestamp,
+        bank::test_utils::update_vote_account_timestamp,
         genesis_utils::{
             create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
         },

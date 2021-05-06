@@ -1,0 +1,115 @@
+// Bank's common fields shared by all supported snapshot versions for deserialization.
+// Sync fields with BankFieldsToSerialize! This is paired with it.
+// All members are made public to remain Bank's members private and to make versioned deserializer workable on this
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BankFieldsToDeserialize {
+    pub(crate) blockhash_queue: BlockhashQueue,
+    pub(crate) ancestors: Ancestors,
+    pub(crate) hash: Hash,
+    pub(crate) parent_hash: Hash,
+    pub(crate) parent_slot: Slot,
+    pub(crate) hard_forks: HardForks,
+    pub(crate) transaction_count: u64,
+    pub(crate) tick_height: u64,
+    pub(crate) signature_count: u64,
+    pub(crate) capitalization: u64,
+    pub(crate) max_tick_height: u64,
+    pub(crate) hashes_per_tick: Option<u64>,
+    pub(crate) ticks_per_slot: u64,
+    pub(crate) ns_per_slot: u128,
+    pub(crate) genesis_creation_time: UnixTimestamp,
+    pub(crate) slots_per_year: f64,
+    pub(crate) unused: u64,
+    pub(crate) slot: Slot,
+    pub(crate) epoch: Epoch,
+    pub(crate) block_height: u64,
+    pub(crate) collector_id: Pubkey,
+    pub(crate) collector_fees: u64,
+    pub(crate) fee_calculator: FeeCalculator,
+    pub(crate) fee_rate_governor: FeeRateGovernor,
+    pub(crate) collected_rent: u64,
+    pub(crate) rent_collector: RentCollector,
+    pub(crate) epoch_schedule: EpochSchedule,
+    pub(crate) inflation: Inflation,
+    pub(crate) stakes: Stakes,
+    pub(crate) epoch_stakes: HashMap<Epoch, EpochStakes>,
+    pub(crate) is_delta: bool,
+}
+
+// Bank's common fields shared by all supported snapshot versions for serialization.
+// This is separated from BankFieldsToDeserialize to avoid cloning by using refs.
+// So, sync fields with BankFieldsToDeserialize!
+// all members are made public to remain Bank private and to make versioned serializer workable on this
+#[derive(Debug)]
+pub(crate) struct BankFieldsToSerialize<'a> {
+    pub(crate) blockhash_queue: &'a RwLock<BlockhashQueue>,
+    pub(crate) ancestors: &'a Ancestors,
+    pub(crate) hash: Hash,
+    pub(crate) parent_hash: Hash,
+    pub(crate) parent_slot: Slot,
+    pub(crate) hard_forks: &'a RwLock<HardForks>,
+    pub(crate) transaction_count: u64,
+    pub(crate) tick_height: u64,
+    pub(crate) signature_count: u64,
+    pub(crate) capitalization: u64,
+    pub(crate) max_tick_height: u64,
+    pub(crate) hashes_per_tick: Option<u64>,
+    pub(crate) ticks_per_slot: u64,
+    pub(crate) ns_per_slot: u128,
+    pub(crate) genesis_creation_time: UnixTimestamp,
+    pub(crate) slots_per_year: f64,
+    pub(crate) unused: u64,
+    pub(crate) slot: Slot,
+    pub(crate) epoch: Epoch,
+    pub(crate) block_height: u64,
+    pub(crate) collector_id: Pubkey,
+    pub(crate) collector_fees: u64,
+    pub(crate) fee_calculator: FeeCalculator,
+    pub(crate) fee_rate_governor: FeeRateGovernor,
+    pub(crate) collected_rent: u64,
+    pub(crate) rent_collector: RentCollector,
+    pub(crate) epoch_schedule: EpochSchedule,
+    pub(crate) inflation: Inflation,
+    pub(crate) stakes: &'a RwLock<Stakes>,
+    pub(crate) epoch_stakes: &'a HashMap<Epoch, EpochStakes>,
+    pub(crate) is_delta: bool,
+}
+
+impl Bank {
+    /// Return subset of bank fields representing serializable state
+    pub(crate) fn get_fields_to_serialize(&self) -> BankFieldsToSerialize {
+        BankFieldsToSerialize {
+            blockhash_queue: &self.blockhash_queue,
+            ancestors: &self.ancestors,
+            hash: *self.hash.read().unwrap(),
+            parent_hash: self.parent_hash,
+            parent_slot: self.parent_slot,
+            hard_forks: &*self.hard_forks,
+            transaction_count: self.transaction_count.load(Relaxed),
+            tick_height: self.tick_height.load(Relaxed),
+            signature_count: self.signature_count.load(Relaxed),
+            capitalization: self.capitalization.load(Relaxed),
+            max_tick_height: self.max_tick_height,
+            hashes_per_tick: self.hashes_per_tick,
+            ticks_per_slot: self.ticks_per_slot,
+            ns_per_slot: self.ns_per_slot,
+            genesis_creation_time: self.genesis_creation_time,
+            slots_per_year: self.slots_per_year,
+            unused: self.unused,
+            slot: self.slot,
+            epoch: self.epoch,
+            block_height: self.block_height,
+            collector_id: self.collector_id,
+            collector_fees: self.collector_fees.load(Relaxed),
+            fee_calculator: self.fee_calculator.clone(),
+            fee_rate_governor: self.fee_rate_governor.clone(),
+            collected_rent: self.collected_rent.load(Relaxed),
+            rent_collector: self.rent_collector.clone(),
+            epoch_schedule: self.epoch_schedule,
+            inflation: *self.inflation.read().unwrap(),
+            stakes: &self.stakes,
+            epoch_stakes: &self.epoch_stakes,
+            is_delta: self.is_delta.load(Relaxed),
+        }
+    }
+}
