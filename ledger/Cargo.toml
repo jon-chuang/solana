@@ -70,7 +70,7 @@ solana-account-decoder = { path = "../account-decoder", version = "=1.7.0" }
 solana-budget-program = { path = "../programs/budget", version = "=1.7.0" }
 
 [build-dependencies]
-rustc_version = "0.2"
+rustc_version = "0.3"
 
 [lib]
 crate-type = ["lib"]
