@@ -218,13 +218,17 @@ impl Meta {
 pub struct Delegation {
     /// to whom the stake is delegated
     pub voter_pubkey: Pubkey,
-    /// activated stake amount, set at delegate() time
-    pub stake: u64,
-    /// epoch at which this stake was activated, std::Epoch::MAX if is a bootstrap stake
-    pub activation_epoch: Epoch,
-    /// epoch the stake was deactivated, std::Epoch::MAX if not deactivated
-    pub deactivation_epoch: Epoch,
-    /// how much stake we can activate per-epoch as a fraction of currently effective stake
+    /// lamports - rent_exempt_reserve
+    pub stakeable: u64,
+    /// How much stake is committed to be effective
+    pub committed_effective_stake: u64,
+    /// epoch at which this stake was last modified
+    pub last_uncommitted_epoch: Epoch,
+    /// how much stake was de/activating at last_uncommitted_epoch
+    pub last_de_or_activating: Epoch,
+    /// whether or not account is deactivating or activating stake
+    pub is_deactivating: bool,
+    /// how much stake we can de/activate per-epoch as a fraction of currently effective stake
     pub warmup_cooldown_rate: f64,
 }
 
@@ -232,9 +236,11 @@ impl Default for Delegation {
     fn default() -> Self {
         Self {
             voter_pubkey: Pubkey::default(),
-            stake: 0,
-            activation_epoch: 0,
-            deactivation_epoch: std::u64::MAX,
+            stakeable: 0,
+            committed_effective_stake: 0,
+            last_uncommitted_epoch: 0,
+            last_de_or_activating: 0,
+            is_deactivating: false,
             warmup_cooldown_rate: Config::default().warmup_cooldown_rate,
         }
     }
@@ -243,20 +249,21 @@ impl Default for Delegation {
 impl Delegation {
     pub fn new(
         voter_pubkey: &Pubkey,
-        stake: u64,
-        activation_epoch: Epoch,
+        stakeable: u64,
+        last_uncommitted_epoch: Epoch,
         warmup_cooldown_rate: f64,
     ) -> Self {
         Self {
             voter_pubkey: *voter_pubkey,
-            stake,
-            activation_epoch,
+            stakeable,
+            last_uncommitted_epoch,
+            last_de_or_activating: stakeable,
             warmup_cooldown_rate,
             ..Delegation::default()
         }
     }
     pub fn is_bootstrap(&self) -> bool {
-        self.activation_epoch == std::u64::MAX
+        self.last_uncommitted_epoch == std::u64::MAX
     }
 
     pub fn stake(
@@ -277,30 +284,23 @@ impl Delegation {
         history: Option<&StakeHistory>,
         fix_stake_deactivate: bool,
     ) -> (u64, u64, u64) {
-        let delegated_stake = self.stake;
-
-        // first, calculate an effective and activating stake
-        let (effective_stake, activating_stake) =
+        let (effective, activating) =
             self.stake_and_activating(target_epoch, history, fix_stake_deactivate);
 
-        // then de-activate some portion if necessary
-        if target_epoch < self.deactivation_epoch {
-            // not deactivated
-            (effective_stake, activating_stake, 0)
-        } else if target_epoch == self.deactivation_epoch {
-            // can only deactivate what's activated
-            (effective_stake, 0, effective_stake.min(delegated_stake))
+        if !self.is_deactivating {
+            (effective, activating, 0)
+        // If deactivating, activating is 0.
         } else if let Some((history, mut prev_epoch, mut prev_cluster_stake)) =
             history.and_then(|history| {
-                history
-                    .get(&self.deactivation_epoch)
-                    .map(|cluster_stake_at_deactivation_epoch| {
+                history.get(&self.last_uncommitted_epoch).map(
+                    |cluster_stake_at_deactivation_epoch| {
                         (
                             history,
-                            self.deactivation_epoch,
+                            self.last_uncommitted_epoch,
                             cluster_stake_at_deactivation_epoch,
                         )
-                    })
+                    },
+                )
             })
         {
             // target_epoch > self.deactivation_epoch
@@ -308,7 +308,8 @@ impl Delegation {
             // loop from my deactivation epoch until the target epoch
             // current effective stake is updated using its previous epoch's cluster stake
             let mut current_epoch;
-            let mut current_effective_stake = effective_stake;
+            let mut current_deactivating_stake = self.last_de_or_activating;
+            let mut total_deactivated = 0;
             loop {
                 current_epoch = prev_epoch + 1;
                 // if there is no deactivating stake at prev epoch, we should have been
@@ -320,7 +321,7 @@ impl Delegation {
                 // I'm trying to get to zero, how much of the deactivation in stake
                 //   this account is entitled to take
                 let weight =
-                    current_effective_stake as f64 / prev_cluster_stake.deactivating as f64;
+                    current_deactivating_stake as f64 / prev_cluster_stake.deactivating as f64;
 
                 // portion of newly not-effective cluster stake I'm entitled to at current epoch
                 let newly_not_effective_cluster_stake =
@@ -328,9 +329,12 @@ impl Delegation {
                 let newly_not_effective_stake =
                     ((weight * newly_not_effective_cluster_stake) as u64).max(1);
 
-                current_effective_stake =
-                    current_effective_stake.saturating_sub(newly_not_effective_stake);
-                if current_effective_stake == 0 {
+                let new_deactivating =
+                    current_deactivating_stake.saturating_sub(newly_not_effective_stake);
+                total_deactivated += current_deactivating_stake - new_deactivating;
+                current_deactivating_stake = new_deactivating;
+
+                if current_deactivating_stake == 0 {
                     break;
                 }
 
@@ -346,7 +350,11 @@ impl Delegation {
             }
 
             // deactivating stake should equal to all of currently remaining effective stake
-            (current_effective_stake, 0, current_effective_stake)
+            (
+                self.committed_effective_stake - total_deactivated,
+                0,
+                current_deactivating_stake,
+            )
         } else {
             // no history or I've dropped out of history, so assume fully deactivated
             (0, 0, 0)
@@ -360,40 +368,38 @@ impl Delegation {
         history: Option<&StakeHistory>,
         fix_stake_deactivate: bool,
     ) -> (u64, u64) {
-        let delegated_stake = self.stake;
-
-        if self.is_bootstrap() {
-            // fully effective immediately
-            (delegated_stake, 0)
-        } else if fix_stake_deactivate && self.activation_epoch == self.deactivation_epoch {
-            // activated but instantly deactivated; no stake at all regardless of target_epoch
-            // this must be after the bootstrap check and before all-is-activating check
-            (0, 0)
-        } else if target_epoch == self.activation_epoch {
-            // all is activating
-            (0, delegated_stake)
-        } else if target_epoch < self.activation_epoch {
-            // not yet enabled
-            (0, 0)
+        if self.last_uncommitted_epoch == u64::MAX {
+            (self.committed_effective_stake, 0)
+        } else if self.is_deactivating {
+            (self.committed_effective_stake, 0)
+        } else if target_epoch == self.last_uncommitted_epoch {
+            // if we've made any changes this epoch, the committed_effective_stake
+            // is the most updated version.
+            (self.committed_effective_stake, self.last_de_or_activating)
+        } else if target_epoch < self.last_uncommitted_epoch {
+            panic!("There is no way to get accurate data before the last_uncommitted_epoch")
         } else if let Some((history, mut prev_epoch, mut prev_cluster_stake)) =
             history.and_then(|history| {
                 history
-                    .get(&self.activation_epoch)
+                    .get(&self.last_uncommitted_epoch)
                     .map(|cluster_stake_at_activation_epoch| {
                         (
                             history,
-                            self.activation_epoch,
+                            self.last_uncommitted_epoch,
                             cluster_stake_at_activation_epoch,
                         )
                     })
             })
         {
-            // target_epoch > self.activation_epoch
+            // target_epoch > self.last_uncommitted_epoch
+            // There is no activating stake in last_uncommitted_epoch
 
             // loop from my activation epoch until the target epoch summing up my entitlement
             // current effective stake is updated using its previous epoch's cluster stake
             let mut current_epoch;
-            let mut current_effective_stake = 0;
+            // If we last committed
+            let mut current_effective_stake = self.committed_effective_stake;
+            let mut current_activating_stake = self.last_de_or_activating;
             loop {
                 current_epoch = prev_epoch + 1;
                 // if there is no activating stake at prev epoch, we should have been
@@ -431,10 +437,7 @@ impl Delegation {
                 }
             }
 
-            (
-                current_effective_stake,
-                delegated_stake - current_effective_stake,
-            )
+            (current_effective_stake, current_activating_stake)
         } else {
             // no history or I've dropped out of history, so assume fully effective
             (delegated_stake, 0)
@@ -451,11 +454,11 @@ impl Delegation {
         // this is chosen to minimize the risks from complicated logic,
         // over some unneeded rewrites
         let corrected_stake = account_balance.saturating_sub(rent_exempt_balance);
-        if self.stake != corrected_stake {
+        if self.stakeable != corrected_stake {
             // this could result in creating a 0-staked account;
             // rewards and staking calc can handle it.
-            let (old, new) = (self.stake, corrected_stake);
-            self.stake = corrected_stake;
+            let (old, new) = (self.stakeable, corrected_stake);
+            self.stakeable = corrected_stake;
             Some((old, new))
         } else {
             None
@@ -998,8 +1001,50 @@ impl<'a> StakeAccount for KeyedAccount<'a> {
             custodian,
         )
     }
+    fn delegate_all(
+        &self,
+        vote_account: &KeyedAccount,
+        clock: &Clock,
+        stake_history: &StakeHistory,
+        config: &Config,
+        signers: &HashSet<Pubkey>,
+        can_reverse_deactivation: bool,
+    ) -> Result<(), InstructionError> {
+        if vote_account.owner()? != solana_vote_program::id() {
+            return Err(InstructionError::IncorrectProgramId);
+        }
+
+        match self.state()? {
+            StakeState::Initialized(meta) => {
+                meta.authorized.check(signers, StakeAuthorize::Staker)?;
+                let stake = Stake::new(
+                    self.lamports()?.saturating_sub(meta.rent_exempt_reserve), // can't stake the rent ;)
+                    vote_account.unsigned_key(),
+                    &State::<VoteStateVersions>::state(vote_account)?.convert_to_current(),
+                    clock.epoch,
+                    config,
+                );
+                self.set_state(&StakeState::Stake(meta, stake))
+            }
+            StakeState::Stake(meta, mut stake) => {
+                meta.authorized.check(signers, StakeAuthorize::Staker)?;
+                stake.redelegate(
+                    self.lamports()?.saturating_sub(meta.rent_exempt_reserve), // can't stake the rent ;)
+                    vote_account.unsigned_key(),
+                    &State::<VoteStateVersions>::state(vote_account)?.convert_to_current(),
+                    clock,
+                    stake_history,
+                    config,
+                    can_reverse_deactivation,
+                )?;
+                self.set_state(&StakeState::Stake(meta, stake))
+            }
+            _ => Err(InstructionError::InvalidAccountData),
+        }
+    }
     fn delegate(
         &self,
+        lamports: u64,
         vote_account: &KeyedAccount,
         clock: &Clock,
         stake_history: &StakeHistory,
